@@ -146,12 +146,13 @@ impl EngramPipeline {
             tracing::warn!(%error, "cannot admit mapped scale preload; keeping all scales mapped");
             0
         });
-        let bytes = tables.iter().map(|table| table.scales().bytes()).sum();
-        let mut placement = MappedPlacement::resolve(4, 2, bytes, scale_preload_cap, host_budget);
+        let scales = tables.iter().filter_map(|table| table.scales()).count();
+        let bytes = tables.iter().filter_map(|table| table.scales()).map(|table| table.bytes()).sum();
+        let mut placement = MappedPlacement::resolve(2 + scales, scales, bytes, scale_preload_cap, host_budget);
         let started = std::time::Instant::now();
         if placement.preloaded > 0 {
             let [first, second] = &mut tables;
-            if let Err(error) = crate::MappedTable::preload_all(&mut [first.scales_mut(), second.scales_mut()]) {
+            if let Err(error) = crate::MappedTable::preload_all(&mut [first.scales_mut().context("missing first scale table")?, second.scales_mut().context("missing second scale table")?]) {
                 placement.fallback(&error);
             }
         }
@@ -185,7 +186,8 @@ impl EngramPipeline {
     pub fn start_warm(&mut self, readers: usize, ready: impl Fn() -> bool + Send + 'static) -> Result<()> {
         ensure!(self.warm.is_none(), "engram warm already started");
         self.warm = Some(crate::formats::mapped_warm::TableWarm::start("engram", self.tables.clone(),
-            |[first, second]| vec![first.scales(), second.scales(), first.weights(), second.weights()],
+            |[first, second]| first.scales().into_iter().chain(second.scales())
+                .chain([first.weights(), second.weights()]).collect(),
             readers, ready)?);
         Ok(())
     }
@@ -495,7 +497,7 @@ mod wait_tests {
         record_layer_wait(&table, std::time::Duration::from_micros(7), true);
         record_layer_wait(&table, std::time::Duration::from_micros(3), false);
         let weight = table.weights().stats().snapshot();
-        let scale = table.scales().stats().snapshot();
+        let scale = table.scales().unwrap().stats().snapshot();
         assert_eq!((weight.consumer_steps, weight.stall_ns), (2, 10_000));
         assert_eq!((weight.decode_steps, weight.decode_stall_ns), (1, 7_000));
         assert_eq!((scale.consumer_steps, scale.stall_ns, scale.decode_steps, scale.decode_stall_ns), (0, 0, 0, 0));
